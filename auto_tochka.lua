@@ -1,6 +1,6 @@
 script_name('AutoToch')
 script_author('Claude')
-script_version('1.7')
+script_version('1.8')
 script_description('Авто-заточка аксессуаров Arizona RP до целевого уровня (/toch)')
 
 -- ВАЖНО: сохраняйте файл в кодировке UTF-8.
@@ -31,11 +31,9 @@ local MIN_PRESS_GAP  = 700     -- минимум между двумя отпр�
 local DELAY_JITTER   = 100     -- случайная добавка к каждой паузе (0..N мс)
 local SIGNAL_CONFIRM_MS = 2500 -- служебная строка чата ("не хватает", "макс. уровень") принимается, только если за это время
                                -- не пришёл настоящий результат заточки (защита от случайных строк в чате), мс
-local RESULT_TIMEOUT = 10000   -- сколько ждать ответ после попытки, мс. Если за это время ничего не произошло -
-                               -- считаем, что слоты пустые / не хватило ресурса, и переставляем предмет и камни
-local CLICK_RETRY_MS  = 4000   -- если за это время нет ответа, ПОВТОРНО жмём "Заточить" (клик мог проигнорироваться
-                               -- из-за анимации), и только потом переставляем предмет и камни
-local CLICK_RETRIES   = 2      -- сколько раз повторять клик до переустановки
+local FAIL_WAIT_MS   = 3000   -- сколько ждём строку "Успех!"; если она не пришла - считаем попытку неудачной и жмём снова, мс
+                               -- (текст неудачи скрипт НЕ читает вообще)
+local REPLACE_EVERY   = 5      -- после стольких неудач подряд заново кладём предмет и камень (самовосстановление), 0 = никогда
 local MAX_TIMEOUTS   = 6       -- сколько раз подряд "ничего не произошло" допускаем до остановки
 local SCAN_WINDOW    = 2500    -- сколько слушать инвентарь после /stats, мс
 local FLASH_DURATION = 1.6     -- длительность зелёной вспышки, сек
@@ -654,7 +652,8 @@ local function sharpenItem(slot, isFirst)
     local placed   = false   -- лежат ли сейчас предмет и камень в ячейках верстака
     local res                -- текущая стопка ресурса в ячейке
     local sup                -- текущая стопка супер-заточки (если используется)
-    local stuck    = 0       -- сколько раз подряд "ничего не произошло"
+    local stuck    = 0
+    local noWin    = 0       -- сколько неудач подряд (без "Успех!")
     local restockFails = 0
 
     chat(string.format('Предмет %d/%d: %s, цель +%d', S.qIndex, S.qTotal, it.name or ('слот ' .. slot), currentTarget()))
@@ -733,7 +732,7 @@ local function sharpenItem(slot, isFirst)
         -- Ставим предмет и камни ТОЛЬКО если они не лежат на верстаке:
         -- в начале, после повышения уровня, когда стопка кончилась или когда "ничего не нажимается".
         if not placed then
-            res = place(stuck >= 2)
+            res = place(false)
             if not res or not S.running then return 'stop' end
         end
 
@@ -749,21 +748,12 @@ local function sharpenItem(slot, isFirst)
         S.lastPressMs = os.clock() * 1000
 
         local t0 = os.clock() * 1000
-        local tSent, retries = t0, 0
         S.lastMsg = nil
         while S.running and not S.result and not S.restock and not S.itemMax and not S.skip
-              and (os.clock() * 1000 - t0) < RESULT_TIMEOUT do
-            wait(50)
+              and (os.clock() * 1000 - t0) < FAIL_WAIT_MS do
+            wait(25)
             local now = os.clock() * 1000
-            -- сервер молчит: скорее всего клик не прошёл (анимация и т.п.) - жмём кнопку ещё раз, ячейки не трогаем
-            if retries < CLICK_RETRIES and not S.result and not S.restock and (now - tSent) >= CLICK_RETRY_MS then
-                retries = retries + 1
-                tSent = now
-                sendCef('startEnchant')
-                S.lastSend = os.clock()
-                S.lastPressMs = os.clock() * 1000
-            end
-            -- служебная строка чата подтверждается только если настоящего результата так и не было
+            -- служебная строка чата подтверждается только если "Успех!" так и не пришёл
             local sg = S.signal
             if sg and not S.result and (now - sg.t) >= SIGNAL_CONFIRM_MS then
                 S.signal = nil
@@ -791,7 +781,7 @@ local function sharpenItem(slot, isFirst)
 
         if S.result then
             -- попытка прошла: ресурс потрачен
-            stuck, restockFails = 0, 0
+            stuck, restockFails, noWin = 0, 0, 0
             if res.amount then res.amount = math.max(0, res.amount - lastNeed) end
             if sup and sup.amount then
                 sup.amount = math.max(0, sup.amount - SUPER_PER_ATTEMPT)
@@ -830,17 +820,26 @@ local function sharpenItem(slot, isFirst)
             chat('{FFAA00}Не хватает ресурса, переставляю предмет и камни...')
             placed = false
         else
-            -- ничего не произошло: слоты пустые или ресурса не хватает
-            stuck = stuck + 1
-            chat(string.format('{FFAA00}Нет ответа от сервера (%d/%d), переставляю предмет и камни.', stuck, MAX_TIMEOUTS))
-            if S.lastMsg then chat('{AAAAAA}Последнее сообщение сервера: ' .. tostring(S.lastMsg)) end
-            if stuck >= MAX_TIMEOUTS then
-                stopRun('{FF5555}Ничего не происходит. Проверьте, что верстак открыт, и хватает денег/камней.')
-                return 'stop'
+            -- "Успех!" не пришёл за FAIL_WAIT_MS => неудача (текст неудачи не читаем)
+            noWin = noWin + 1
+            S.failCount = S.failCount + 1
+            chat(string.format('{FF8888}Неудача на +%d (попыток: %d)', S.level, S.attempts))
+            if res.amount then res.amount = math.max(0, res.amount - lastNeed) end
+            if sup and sup.amount then
+                sup.amount = math.max(0, sup.amount - SUPER_PER_ATTEMPT)
+                if sup.amount < SUPER_PER_ATTEMPT then placed = false end
             end
-            -- второй раз подряд: считаем текущую стопку пустой и пробуем другую
-            if stuck >= 2 and res.amount then res.amount = 0 end
-            placed = false
+            if sup then
+                -- супер-заточка не сработала: уровень упал, снова нужны камни
+                S.level = math.max(0, S.level - SUPER_FAIL_DROP)
+                chat(string.format('{FFAA00}Супер-заточка не сработала: считаю, что уровень упал до +%d.', S.level))
+                placed = false
+            elseif res.amount and res.amount < lastNeed then
+                chat('{FFAA00}Камни в ячейке закончились, ставлю новые...')
+                placed = false
+            elseif REPLACE_EVERY > 0 and noWin % REPLACE_EVERY == 0 then
+                placed = false   -- страховка: заново кладём предмет и камень (без очистки ячеек)
+            end
         end
 
         pause(CYCLE_DELAY)
@@ -983,37 +982,7 @@ function sampev.onServerMessage(color, text)
         return
     end
 
-    -- неудача
-    if startsNear(clean, 'Увы, вам не удалось улучшить предмет') then
-        local fname, ffrom, fto = clean:match('Увы, вам не удалось улучшить предмет (.-) %S+ %+(%d+) на %+(%d+)')
-        ffrom, fto = tonumber(ffrom), tonumber(fto)
-        if ffrom and ffrom >= 0 and ffrom <= 30 then
-            dump(string.format('ACCEPT fail color=%s: %s', tostring(color), clean))
-            S.signal = nil
-            S.level = ffrom
-            S.failCount = S.failCount + 1
-            S.result = { ok = false, from = ffrom, newLevel = (fto and fto < ffrom) and fto or nil }
-            chat(string.format('{FF8888}Неудача на +%d (попыток: %d)', ffrom, S.attempts))
-        end
-        return
-    end
-    -- Запасной разбор: у супер-заточки текст неудачи может отличаться ("Увы ... понижен до +11" и т.п.)
-    -- Строго: начинается с "Увы", есть уровень "+N" и речь про улучшение/заточку предмета
-    if S.awaiting and startsNear(clean, 'Увы', 6) and clean:find('%+%d+')
-       and hasAny(clean, { 'улучш', 'заточ' }) then
-        local nums = {}
-        for v in clean:gmatch('%+(%d+)') do nums[#nums + 1] = tonumber(v) end
-        local from = nums[1] or S.level
-        local newLv
-        if #nums >= 2 and nums[#nums] < nums[1] then newLv = nums[#nums] end
-        dump(string.format('ACCEPT fail(generic) color=%s: %s', tostring(color), clean))
-        S.signal = nil
-        S.level = from
-        S.failCount = S.failCount + 1
-        S.result = { ok = false, from = from, newLevel = newLv }
-        chat('{FF8888}Неудача: ' .. clean)
-        return
-    end
+    -- Строки о неудаче НЕ читаем: неудачей считается отсутствие "Успех!" за FAIL_WAIT_MS.
 
     -- Дальше - только пока ждём результат.
     -- Эти строки НИЧЕГО не меняют сразу: только запоминаем сигнал. Цикл примет его, лишь если за
@@ -1633,7 +1602,23 @@ local function runSub(cmd, rest)
         saveCfg()
         chat('Сохранённые события кликов сброшены.')
     elseif cmd == 'help' then
-        chat('/toch - меню | /toch_stop | /toch_skip (пропустить предмет) | /toch_clear (очистить очередь) | /toch_super [N] | /toch_update | /toch_cef [test] | /toch_scan | /toch_go | /toch_show | /toch_level N | /toch_delay MS | /toch_dump')
+        chat('Команды:')
+        for _, l in ipairs({
+            '{FFD700}/toch{FFFFFF} - меню выбора аксессуара',
+            '{FFD700}/toch_stop{FFFFFF} - остановить заточку',
+            '{FFD700}/toch_skip{FFFFFF} - пропустить текущий предмет',
+            '{FFD700}/toch_clear{FFFFFF} - очистить очередь',
+            '{FFD700}/toch_super [N]{FFFFFF} - супер-заточка вкл/выкл (цель +N)',
+            '{FFD700}/toch_level N{FFFFFF} - целевой уровень',
+            '{FFD700}/toch_delay MS{FFFFFF} - пауза между действиями',
+            '{FFD700}/toch_scan{FFFFFF} - пересканировать инвентарь',
+            '{FFD700}/toch_go{FFFFFF} - принудительный старт (если верстак не определился)',
+            '{FFD700}/toch_show{FFFFFF} - состояние интерфейса',
+            '{FFD700}/toch_update{FFFFFF} - проверить обновление',
+            '{FFD700}/toch_cef [test]{FFFFFF} - окно обновления через CEF',
+            '{FFD700}/toch_dump{FFFFFF} - лог CEF-событий',
+            '{FFD700}F12{FFFFFF} - аварийная остановка',
+        }) do chat(l) end
     end
 end
 

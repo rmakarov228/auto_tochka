@@ -1,5 +1,5 @@
 {
-  "version": "1.7",
+  "version": "1.8",
   "url": "https://raw.githubusercontent.com/rmakarov228/auto_tochka/main/auto_tochka.lua",
-  "changelog": "Слоты больше не очищаются. Строки чата не действуют сразу. Задержка между нажатиями. Между нажатиями «Заточить предмет» теперь 450 мс."
+  "changelog": "Новый /toch_help | Не логирование строчек о неудаче"
 }
