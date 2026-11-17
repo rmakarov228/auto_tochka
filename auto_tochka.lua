@@ -1,6 +1,6 @@
 script_name('AutoToch')
 script_author('Claude')
-script_version('1.3')
+script_version('1.6')
 script_description('Авто-заточка аксессуаров Arizona RP до целевого уровня (/toch)')
 
 -- ВАЖНО: сохраняйте файл в кодировке UTF-8.
@@ -30,6 +30,9 @@ local CYCLE_DELAY    = 1200    -- пауза после результата д�
 local DELAY_JITTER   = 150     -- случайная добавка к каждой паузе (0..N мс)
 local RESULT_TIMEOUT = 10000   -- сколько ждать ответ после попытки, мс. Если за это время ничего не произошло -
                                -- считаем, что слоты пустые / не хватило ресурса, и переставляем предмет и камни
+local CLICK_RETRY_MS  = 3000   -- если за это время нет ответа, ПОВТОРНО жмём "Заточить" (клик мог проигнорироваться
+                               -- из-за анимации), и только потом переставляем предмет и камни
+local CLICK_RETRIES   = 2      -- сколько раз повторять клик до переустановки
 local MAX_TIMEOUTS   = 3       -- сколько раз подряд "ничего не произошло" допускаем до остановки
 local SCAN_WINDOW    = 2500    -- сколько слушать инвентарь после /stats, мс
 local FLASH_DURATION = 1.6     -- длительность зелёной вспышки, сек
@@ -80,6 +83,7 @@ local S = {
     itemMax   = false,
     skip      = false,
     runSuper  = false,  -- в текущем запуске включена супер-заточка
+    updCef    = false,  -- окно обновления рисовать через CEF (/toch_cef)
     runTarget = nil,    -- цель текущего запуска
     manualSuper = nil,  -- ручной слот супер-заточки
     resource  = nil,    -- 'stone' | 'amulet'
@@ -184,6 +188,7 @@ local function loadCfg()
         cfg.buttonSeq = t.buttonSeq
         if t.superOn ~= nil then superChk[0] = t.superOn and true or false end
         if tonumber(t.superTarget) then superBuf[0] = tonumber(t.superTarget) end
+        if t.updCef ~= nil then S.updCef = t.updCef and true or false end
     end
 end
 
@@ -710,6 +715,13 @@ local function sharpenItem(slot, isFirst)
     pause(isFirst and START_DELAY or CYCLE_DELAY)
 
     while S.running do
+        -- на всякий случай: если потеряна связь с сервером (кик, вылет) - останавливаемся, а не крутимся вхолостую
+        local okConn, gs = pcall(sampGetGamestate)
+        if okConn and gs ~= 3 then
+            stopRun('{FF5555}Нет соединения с сервером. Остановка.')
+            return 'stop'
+        end
+
         -- Ставим предмет и камни ТОЛЬКО если они не лежат на верстаке:
         -- в начале, после повышения уровня, когда стопка кончилась или когда "ничего не нажимается".
         if not placed then
@@ -722,11 +734,22 @@ local function sharpenItem(slot, isFirst)
         S.awaiting = true
         S.attempts = S.attempts + 1
         sendCef('startEnchant')
+        S.lastSend = os.clock()
 
         local t0 = os.clock() * 1000
+        local tSent, retries = t0, 0
+        S.lastMsg = nil
         while S.running and not S.result and not S.restock and not S.itemMax and not S.skip
               and (os.clock() * 1000 - t0) < RESULT_TIMEOUT do
             wait(50)
+            local now = os.clock() * 1000
+            -- сервер молчит: скорее всего клик не прошёл (анимация и т.п.) - жмём кнопку ещё раз, ячейки не трогаем
+            if retries < CLICK_RETRIES and not S.result and not S.restock and (now - tSent) >= CLICK_RETRY_MS then
+                retries = retries + 1
+                tSent = now
+                sendCef('startEnchant')
+                S.lastSend = os.clock()
+            end
         end
         S.awaiting = false
         if not S.running then return 'stop' end
@@ -784,6 +807,7 @@ local function sharpenItem(slot, isFirst)
             -- ничего не произошло: слоты пустые или ресурса не хватает
             stuck = stuck + 1
             chat(string.format('{FFAA00}Нет ответа от сервера (%d/%d), переставляю предмет и камни.', stuck, MAX_TIMEOUTS))
+            if S.lastMsg then chat('{AAAAAA}Последнее сообщение сервера: ' .. tostring(S.lastMsg)) end
             if stuck >= MAX_TIMEOUTS then
                 stopRun('{FF5555}Ничего не происходит. Проверьте, что верстак открыт, и хватает денег/камней.')
                 return 'stop'
@@ -885,42 +909,75 @@ end
 ------------------------------------------------------------------------
 -- ЧАТ: РЕЗУЛЬТАТЫ ЗАТОЧКИ
 ------------------------------------------------------------------------
+-- Похоже ли сообщение на реплику игрока (VIP-чат, /b, обычный чат и т.п.): "[VIP] Ник[12]: текст", "Ник_Фамилия: текст".
+-- Такие строки скрипт полностью игнорирует, чтобы случайная фраза в чате не сбила заточку.
+local function looksLikePlayerChat(t)
+    if t:find('%[%d+%]%s*:') then return true end                                   -- Ник[12]: ...
+    if t:find('^%s*[%[%(][^%]%)]*[%]%)]%s*[%w_%.]+[%[%(]?%d*[%]%)]?%s*:') then return true end  -- [VIP] Ник: ...
+    if t:find('^%s*[%w_%.]+%s*:') then return true end                               -- Nick_Name: ...
+    if t:find('^%s*[%[%(][^%]%)]*[Vv][Ii][Pp][^%]%)]*[%]%)]') then return true end   -- [VIP] ...
+    return false
+end
+
+-- Фраза должна стоять в самом начале сообщения (допускается короткий префикс), а не где-то в тексте игрока
+local function startsNear(t, phrase, maxOffset)
+    local pos = t:find(phrase, 1, true)
+    return pos ~= nil and pos <= (maxOffset or 20)
+end
+
+local RESTOCK_CONTEXT = { 'заточ', 'точил', 'камн', 'амулет', 'ресурс', 'супер' }
+
 function sampev.onServerMessage(color, text)
     if not S.running then return end
     local clean = u8(text):gsub('{%x%x%x%x%x%x}', '')
 
+    -- Реплики игроков (VIP-чат и т.д.) не обрабатываем вообще
+    if looksLikePlayerChat(clean) then return end
+
+    -- Результат попытки принимаем только пока ждём ответ (или сразу после отправки клика: ответ мог запоздать)
+    local waiting = S.awaiting or (S.lastSend ~= nil and (os.clock() - S.lastSend) < 15)
+    if not waiting then return end
+
     -- успех
-    local name, from, to = clean:match('Успех! Вам удалось улучшить предмет (.-) %S+ %+(%d+) на %+(%d+)')
-    if to then
-        to = tonumber(to)
-        S.level = to
-        S.okCount = S.okCount + 1
-        S.result = { ok = true, from = tonumber(from), to = to }
-        triggerFlash(to)
-        chat(string.format('{55FF55}Успех! %s +%d -> +%d (попыток: %d)', name or '', tonumber(from), to, S.attempts))
-        if to >= currentTarget() then
-            S.targetReached = true   -- цикл сам перейдёт к следующему предмету очереди
+    if startsNear(clean, 'Успех! Вам удалось улучшить предмет') then
+        local name, from, to = clean:match('Успех! Вам удалось улучшить предмет (.-) %S+ %+(%d+) на %+(%d+)')
+        from, to = tonumber(from), tonumber(to)
+        if to and from and to == from + 1 and from >= 0 and to <= 30 then
+            dump(string.format('ACCEPT success color=%s: %s', tostring(color), clean))
+            S.level = to
+            S.okCount = S.okCount + 1
+            S.result = { ok = true, from = from, to = to }
+            triggerFlash(to)
+            chat(string.format('{55FF55}Успех! %s +%d -> +%d (попыток: %d)', name or '', from, to, S.attempts))
+            if to >= currentTarget() then
+                S.targetReached = true   -- цикл сам перейдёт к следующему предмету очереди
+            end
         end
         return
     end
 
     -- неудача
-    local fname, ffrom, fto = clean:match('Увы, вам не удалось улучшить предмет (.-) %S+ %+(%d+) на %+(%d+)')
-    if ffrom then
+    if startsNear(clean, 'Увы, вам не удалось улучшить предмет') then
+        local fname, ffrom, fto = clean:match('Увы, вам не удалось улучшить предмет (.-) %S+ %+(%d+) на %+(%d+)')
         ffrom, fto = tonumber(ffrom), tonumber(fto)
-        S.level = ffrom
-        S.failCount = S.failCount + 1
-        S.result = { ok = false, from = ffrom, newLevel = (fto and fto < ffrom) and fto or nil }
-        chat(string.format('{FF8888}Неудача на +%d (попыток: %d)', ffrom, S.attempts))
+        if ffrom and ffrom >= 0 and ffrom <= 30 then
+            dump(string.format('ACCEPT fail color=%s: %s', tostring(color), clean))
+            S.level = ffrom
+            S.failCount = S.failCount + 1
+            S.result = { ok = false, from = ffrom, newLevel = (fto and fto < ffrom) and fto or nil }
+            chat(string.format('{FF8888}Неудача на +%d (попыток: %d)', ffrom, S.attempts))
+        end
         return
     end
     -- Запасной разбор: у супер-заточки текст неудачи может отличаться ("Увы ... понижен до +11" и т.п.)
-    if S.awaiting and clean:find('Увы', 1, true) then
+    -- Строго: сообщение начинается с "Увы" и содержит уровень "+N"
+    if S.awaiting and startsNear(clean, 'Увы', 12) and clean:find('%+%d+') then
         local nums = {}
         for v in clean:gmatch('%+(%d+)') do nums[#nums + 1] = tonumber(v) end
         local from = nums[1] or S.level
         local newLv
         if #nums >= 2 and nums[#nums] < nums[1] then newLv = nums[#nums] end
+        dump(string.format('ACCEPT fail(generic) color=%s: %s', tostring(color), clean))
         S.level = from
         S.failCount = S.failCount + 1
         S.result = { ok = false, from = from, newLevel = newLv }
@@ -928,9 +985,9 @@ function sampev.onServerMessage(color, text)
         return
     end
 
-    -- Дальше реагируем только на сообщения, пришедшие пока мы ждём результат попытки
-    -- (иначе любая фраза из чата игроков вроде "у вас нет" сбивала бы заточку).
+    -- Дальше - только пока ждём результат
     if not S.awaiting then return end
+    S.lastMsg = clean   -- для диагностики: что сервер писал, пока мы ждали ответ
     local n = norm(clean)
     for _, kw in ipairs(ITEM_MAX_KEYWORDS) do
         if n:find(norm(kw), 1, true) then
@@ -944,12 +1001,17 @@ function sampev.onServerMessage(color, text)
             return
         end
     end
-    -- не хватает ресурса: цикл сам переставит предмет и камни
+    -- не хватает ресурса: цикл сам переставит предмет и камни.
+    -- Только если сообщение про заточку/ресурсы (иначе любая служебная строка сервера давала бы ложную тревогу).
     for _, kw in ipairs(RESTOCK_KEYWORDS) do
         if n:find(norm(kw), 1, true) then
-            S.restockText = clean
-            S.restock = true
-            return
+            for _, ctx in ipairs(RESTOCK_CONTEXT) do
+                if n:find(norm(ctx), 1, true) then
+                    S.restockText = clean
+                    S.restock = true
+                    return
+                end
+            end
         end
     end
 end
@@ -1355,11 +1417,80 @@ local function checkUpdate(manual)
         if not manual and declinedVersion == tostring(info.version) then return end
 
         pendingUpdate = { version = tostring(info.version), url = info.url, changelog = info.changelog }
-        winUpd[0] = true
         chat(string.format('{FFD700}Доступно обновление %s (у вас %s).', pendingUpdate.version, current))
+        if S.updCef then showUpdateCef(pendingUpdate) else winUpd[0] = true end
     end)
     updating = false
     if not ok and manual then chat('{FF5555}Обновление: ' .. tostring(err)) end
+end
+
+-- ======== Окно обновления через CEF (опционально, /toch_cef) ========
+-- Lua -> страница: в игровой браузер посылается эмулированный входящий пакет 220/17 с кодом JS,
+-- который рисует панель. Обратной связи JS -> Lua нет: панель только показывает текст,
+-- а кнопки "Y - скачать" и "N - позже" обрабатывает Lua клавишами.
+local UPD_PANEL_ID = 'autotoch-upd'
+local cefPanelActive = false
+
+local function evalCef(code)
+    local bs = raknetNewBitStream()
+    raknetBitStreamWriteInt8(bs, 17)
+    raknetBitStreamWriteInt32(bs, 0)
+    raknetBitStreamWriteInt16(bs, #code)
+    raknetBitStreamWriteInt8(bs, 0)
+    raknetBitStreamWriteString(bs, code)
+    raknetEmulPacketReceiveBitStream(220, bs)
+    raknetDeleteBitStream(bs)
+end
+
+local function jsQuote(str)   -- безопасная строка для JS (текст кладём через textContent, не innerHTML)
+    str = tostring(str or ''):gsub('\\', '\\\\'):gsub("'", "\\'"):gsub('\r', ''):gsub('\n', '\\n')
+    return "'" .. str .. "'"
+end
+
+local function hideUpdateCef()
+    evalCef("var e=document.getElementById('" .. UPD_PANEL_ID .. "');if(e){e.remove();}")
+end
+
+local function showUpdateCef(info, demo)
+    if cefPanelActive then return end
+    cefPanelActive = true
+    local js = table.concat({
+        "(function(){",
+        "var o=document.getElementById('", UPD_PANEL_ID, "');if(o){o.remove();}",
+        "var d=document.createElement('div');d.id='", UPD_PANEL_ID, "';",
+        "d.style.cssText='position:fixed;right:24px;top:30%;width:340px;padding:16px 18px;",
+        "background:rgba(18,20,28,.94);color:#fff;font:15px/1.4 Arial,sans-serif;",
+        "border:1px solid #ffd54a;border-radius:10px;z-index:2147483647;pointer-events:none;",
+        "box-shadow:0 6px 24px rgba(0,0,0,.5)';",
+        "function row(t,css){var r=document.createElement('div');r.style.cssText=css||'';r.textContent=t;d.appendChild(r);}",
+        "row(", jsQuote('AutoToch: доступно обновление'), ",'font-weight:700;color:#ffd54a;margin-bottom:6px');",
+        "row(", jsQuote(string.format('Версия %s (у вас %s)', info.version, thisScript().version)), ",'margin-bottom:6px');",
+        "row(", jsQuote(info.changelog or ''), ",'color:#cfd3dc;margin-bottom:10px');",
+        "row(", jsQuote('Y - скачать и установить     N - позже'), ",'font-weight:700;color:#7CFC9A');",
+        "document.body.appendChild(d);})();",
+    })
+    evalCef(js)
+    chat('{FFD700}Окно обновления (CEF): нажмите Y - скачать, N - позже.')
+    lua_thread.create(function()
+        local t0 = os.clock()
+        local choice
+        while os.clock() - t0 < 60 and not choice do
+            wait(0)
+            if not (sampIsChatInputActive() or sampIsDialogActive()) then
+                if wasKeyPressed(0x59) then choice = 'yes'       -- Y
+                elseif wasKeyPressed(0x4E) then choice = 'no' end -- N
+            end
+        end
+        hideUpdateCef()
+        cefPanelActive = false
+        if choice == 'yes' then
+            if demo then chat('Демо-окно: Y нажата (в реальном обновлении здесь началась бы загрузка).')
+            else installUpdate(info) end
+        else
+            if not demo then declinedVersion = info.version end
+            chat(choice == 'no' and 'Обновление отложено.' or 'Окно обновления закрыто по времени.')
+        end
+    end)
 end
 
 imgui.OnFrame(function() return winUpd[0] and pendingUpdate ~= nil end, function(self)
@@ -1393,7 +1524,7 @@ end)
 
 
 -- Подкоманды теперь отдельные команды через "_": /toch_stop, /toch_go и т.д.
-local SUBCOMMANDS = { 'stop', 'skip', 'clear', 'super', 'update', 'level', 'delay', 'learn', 'go', 'show', 'dump', 'scan', 'reset', 'help' }
+local SUBCOMMANDS = { 'stop', 'skip', 'clear', 'super', 'update', 'cef', 'level', 'delay', 'learn', 'go', 'show', 'dump', 'scan', 'reset', 'help' }
 
 local function runSub(cmd, rest)
     rest = rest or ''
@@ -1403,6 +1534,17 @@ local function runSub(cmd, rest)
         if S.running then S.skip = true else chat('Заточка не запущена.') end
     elseif cmd == 'clear' then
         if S.running then chat('Во время заточки очередь менять нельзя.') else S.queue = {} chat('Очередь очищена.') end
+    elseif cmd == 'cef' then
+        -- /toch_cef - вкл/выкл CEF-окно обновления, /toch_cef test - показать демо-панель
+        if rest:lower():find('test', 1, true) then
+            showUpdateCef({ version = '9.9', changelog = 'Это тест CEF-панели. Y/N закроют её.' }, true)
+        else
+            S.updCef = not S.updCef
+            cfg.updCef = S.updCef
+            saveCfg()
+            chat('Окно обновления через CEF: ' .. (S.updCef and 'ВКЛ' or 'ВЫКЛ (используется mimgui)')
+                .. '. Проверка: /toch_cef test')
+        end
     elseif cmd == 'update' then
         lua_thread.create(function() checkUpdate(true) end)
     elseif cmd == 'super' then
@@ -1456,7 +1598,7 @@ local function runSub(cmd, rest)
         saveCfg()
         chat('Сохранённые события кликов сброшены.')
     elseif cmd == 'help' then
-        chat('/toch - меню | /toch_stop | /toch_skip (пропустить предмет) | /toch_clear (очистить очередь) | /toch_super [N] | /toch_update | /toch_scan | /toch_go | /toch_show | /toch_level N | /toch_delay MS | /toch_dump')
+        chat('/toch - меню | /toch_stop | /toch_skip (пропустить предмет) | /toch_clear (очистить очередь) | /toch_super [N] | /toch_update | /toch_cef [test] | /toch_scan | /toch_go | /toch_show | /toch_level N | /toch_delay MS | /toch_dump')
     end
 end
 

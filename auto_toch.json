@@ -1,5 +1,5 @@
 {
-  "version": "1.3",
+  "version": "1.6",
   "url": "https://raw.githubusercontent.com/rmakarov228/auto_tochka/main/auto_tochka.lua",
-  "changelog": "Первая версия с автообновлением"
+  "changelog": "Защита от случайных строк VIP-чата и чата игроков, проверка соединения, повтор клика при молчании сервера"
 }
