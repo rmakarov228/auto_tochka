@@ -1,5 +1,5 @@
 {
-  "version": "2.1",
+  "version": "2.2",
   "url": "https://raw.githubusercontent.com/rmakarov228/auto_tochka/main/auto_tochka.lua",
   "changelog": "Новый /toch_help | Не логирование строчек о неудаче"
 }

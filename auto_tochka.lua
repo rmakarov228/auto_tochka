@@ -1,6 +1,6 @@
 script_name('AutoToch')
 script_author('Claude')
-script_version('2.1')
+script_version('2.2')
 script_description('Авто-заточка аксессуаров Arizona RP до целевого уровня (/toch)')
 
 -- ВАЖНО: сохраняйте файл в кодировке UTF-8.
@@ -206,13 +206,6 @@ local function parseLevel(name)
     return tonumber(name:match('%(%s*%+(%d+)%s*%)')) or tonumber(name:match('%+(%d+)'))
 end
 
--- Название без уровня заточки: "Очки (+12)" -> "Очки"
-local function stripLevel(name)
-    local s = tostring(name or '')
-    s = s:gsub('%(%s*%+%d+%s*%)', ''):gsub('%+%d+', ''):gsub('%s+', ' ')
-    return (s:gsub('^%s+', ''):gsub('%s+$', ''))
-end
-
 local function parseInventory(raw)
     if not raw:find('"slot"', 1, true) then return 0 end
     raw = raw:gsub('\\"', '"')
@@ -228,10 +221,7 @@ local function parseInventory(raw)
             local it = S.items[slot] or { slot = slot }
             it.id     = tonumber(obj:match('"item"%s*:%s*(%d+)')) or it.id
             it.amount = tonumber(obj:match('"amount"%s*:%s*(%d+)')) or it.amount
-            if name and name ~= '' then
-                it.name = name
-                it.rev = (it.rev or 0) + 1   -- сколько раз сервер присылал данные этого слота (для определения реального уровня)
-            end
+            if name and name ~= '' then it.name = name end
             S.items[slot] = it
             count = count + 1
         end
@@ -537,16 +527,14 @@ local function respondDialogLater(id, button, listitem)
 end
 
 -- Возвращает true, если инвентарь получен
-local function scanInventoryInner()
+local function scanInventory()
+    if S.scanning or S.running then return false end
+    S.scanning = true
     local backup = S.items
-    S.scanBackup = backup
     S.items = {}
     S.gotItems = false
     S.dialogSeen = false
     S.scanDone = false
-    S.scanCancel = false
-    S.statsClicks = 0
-    S.seenPages = {}
     S.pages = 0
     S.lastExtras = nil
     chat('Сканирую инвентарь через ' .. STATS_COMMAND .. '...')
@@ -555,7 +543,7 @@ local function scanInventoryInner()
     -- Диалоги /stats -> "Предметы" перехватываются в onShowDialog.
     -- Если диалог не пришёл (интерфейс на CEF), нажимаем Enter вручную.
     local t0 = os.clock() * 1000
-    while not S.dialogSeen and not S.scanCancel and (os.clock() * 1000 - t0) < 1500 do wait(50) end
+    while not S.dialogSeen and (os.clock() * 1000 - t0) < 1500 do wait(50) end
     local usedKey = false
     if not S.dialogSeen then
         tapKey(0x0D) -- Enter = "Предметы"
@@ -565,7 +553,7 @@ local function scanInventoryInner()
     -- ждём все страницы списка (onShowDialog листает их сам и ставит scanDone)
     t0 = os.clock() * 1000
     local lastPages, tPage = 0, t0
-    while not S.scanDone and not S.scanCancel and (os.clock() * 1000 - t0) < 15000 do
+    while not S.scanDone and (os.clock() * 1000 - t0) < 20000 do
         wait(50)
         if (S.pages or 0) ~= lastPages then
             lastPages, tPage = S.pages or 0, os.clock() * 1000
@@ -573,8 +561,7 @@ local function scanInventoryInner()
         -- страницы перестали приходить: заканчиваем ожидание
         if (os.clock() * 1000 - tPage) > (SCAN_WINDOW + 2000) then break end
     end
-    S.scanDone = true   -- с этого момента onShowDialog больше не кликает по диалогам сам
-    wait(450)
+    wait(300)
     -- закрываем только оставшийся диалог; ESC - лишь если пришлось жать Enter вручную
     closeGameUi(usedKey and not S.gotItems)
     S.scanning = false
@@ -595,30 +582,11 @@ local function scanInventoryInner()
         local ex = S.lastExtras or {}
         if #ex > 0 then
             local parts = {}
-            for i = 1, math.min(#ex, 4) do
-                local tx = ex[i].text:gsub('^%s+', ''):gsub('%s+$', '')
-                parts[#parts + 1] = '"' .. tx .. '"'
-            end
+            for i = 1, math.min(#ex, 4) do parts[#parts + 1] = '"' .. ex[i].text:gsub('^%s+', ''):gsub('%s+$', '') .. '"' end
             chat('Служебные строки диалога: ' .. table.concat(parts, ', '))
         end
         return true
     end
-end
-
--- Обёртка: что бы ни случилось внутри, флаг scanning гарантированно снимается
--- (раньше при ошибке/зависании он оставался true: меню было скрыто и скан "шёл бесконечно").
-local function scanInventory()
-    if S.scanning or S.running then return false end
-    S.scanning = true
-    local ok, res = pcall(scanInventoryInner)
-    S.scanning = false
-    S.scanDone = true
-    if not ok then
-        if next(S.items) == nil then S.items = S.scanBackup or {} end
-        chat('{FF5555}Ошибка сканирования: ' .. tostring(res))
-        return false
-    end
-    return res
 end
 
 ------------------------------------------------------------------------
@@ -688,23 +656,6 @@ local function sharpenItem(slot, isFirst)
     local needReset = true   -- перед самой первой установкой этого предмета очищаем ячейки один раз
     local noWin    = 0       -- сколько неудач подряд (без "Успех!")
     local restockFails = 0
-    local baseName = stripLevel(it.name)   -- название без "(+N)": по нему узнаём свой предмет в обновлениях инвентаря
-    local pressRev = 0                      -- номер обновления слота на момент нажатия "Заточить предмет"
-    local lastDesc                          -- что лежало на верстаке в прошлый раз (для сообщения в чат)
-
-    -- нужна ли сейчас супер-заточка (только в режиме супер-заточки и с уровня +SUPER_MIN_LEVEL)
-    local function needSuper()
-        return S.runSuper and S.level >= SUPER_MIN_LEVEL
-    end
-
-    -- Реальный уровень предмета по данным сервера: сервер присылает обновлённое название "(+N)".
-    -- Берём только обновления, пришедшие ПОСЛЕ rev0, и только если это наш предмет (то же название без уровня).
-    local function levelFromItem(rev0)
-        local cur = S.items[slot]
-        if not cur or (cur.rev or 0) <= (rev0 or 0) then return nil end
-        if stripLevel(cur.name) ~= baseName then return nil end
-        return parseLevel(cur.name)
-    end
 
     chat(string.format('Предмет %d/%d: %s, цель +%d', S.qIndex, S.qTotal, it.name or ('слот ' .. slot), currentTarget()))
 
@@ -713,8 +664,7 @@ local function sharpenItem(slot, isFirst)
     -- просто перезаписываются поверх, чтобы ничего не вылетало на верстак.
     -- Всё это происходит в паузе между нажатиями (кулдаун 2 сек), на скорость цикла не влияет.
     -- Возвращает стопку ресурса или nil (тогда уже вызван stopRun, предмет остаётся на верстаке).
-    local function place(hardReset, depth)
-        depth = depth or 0
+    local function place(hardReset)
         local kind = phaseKind()
         if kind ~= lastKind then lastNeed, lastKind = 1, kind end   -- камни и амулеты расходуются по-разному
         local cand = findResource(kind, lastNeed)
@@ -726,7 +676,7 @@ local function sharpenItem(slot, isFirst)
 
         -- супер-заточка нужна только на уровнях +SUPER_MIN_LEVEL и выше
         sup = nil
-        if needSuper() then
+        if S.runSuper and S.level >= SUPER_MIN_LEVEL then
             sup = findSuper()
             if not sup then
                 stopRun('{FF5555}Супер-заточка закончилась или не найдена. Остановка.')
@@ -740,18 +690,8 @@ local function sharpenItem(slot, isFirst)
             if not S.running then return nil end
         end
 
-        -- сообщение в чат только когда состав ячеек поменялся (камень <-> амулет + супер-заточка)
-        local desc = (sup and 'амулет + супер-заточка' or (kind == 'amulet' and 'амулет' or 'камень'))
-        if desc ~= lastDesc then
-            if S.runSuper then
-                chat(string.format('{AAAAFF}Уровень +%d: ставлю %s.', S.level, desc))
-            end
-            lastDesc = desc
-        end
-
         -- 1) кладём аксессуар в ячейку "Предмет"
         S.need = nil
-        local rev0 = (S.items[slot] and S.items[slot].rev) or 0
         sendEnchantSlots(slot, -1, -1)
 
         -- клиент сообщает, сколько камней нужно для этого уровня: "(4 шт.)" - выходим сразу, как пришло
@@ -759,18 +699,6 @@ local function sharpenItem(slot, isFirst)
         while S.running and not S.need and (os.clock() * 1000 - t1) < 1200 do wait(25) end
         local need = S.need or lastNeed
         lastNeed = need
-
-        -- сервер мог прислать актуальный уровень предмета: сверяем (вдруг упал не так, как мы думали)
-        if S.runSuper and depth < 2 then
-            local real = levelFromItem(rev0)
-            if real and real ~= S.level then
-                chat(string.format('{FFAA00}Реальный уровень предмета: +%d (скрипт считал +%d).', real, S.level))
-                S.level = real
-                if phaseKind() ~= kind or needSuper() ~= (sup ~= nil) then
-                    return place(false, depth + 1)   -- состав ячеек надо поменять
-                end
-            end
-        end
         if cand.amount and cand.amount < need then
             cand = findResource(kind, need)
             if not cand then
@@ -812,8 +740,7 @@ local function sharpenItem(slot, isFirst)
         end
 
         -- кнопка "Заточить предмет" (в обычном режиме - единственное действие за попытку)
-        S.result, S.restock, S.signal, S.failLevel = nil, false, nil, nil
-        pressRev = (S.items[slot] and S.items[slot].rev) or 0
+        S.result, S.restock, S.signal = nil, false, nil
         -- задержка между нажатиями "Заточить предмет": не чаще, чем раз в MIN_PRESS_GAP
         while S.running and S.lastPressMs and (os.clock() * 1000 - S.lastPressMs) < MIN_PRESS_GAP do wait(25) end
         if not S.running then return 'stop' end
@@ -904,44 +831,17 @@ local function sharpenItem(slot, isFirst)
                 sup.amount = math.max(0, sup.amount - SUPER_PER_ATTEMPT)
                 if sup.amount < SUPER_PER_ATTEMPT then placed = false end
             end
-            -- реальный уровень после неудачи: 1) из сообщения сервера, 2) из обновления инвентаря, 3) предположение
-            local before = S.level
-            local newLevel, how = nil, nil
-            if S.failLevel and S.failLevel <= before then
-                newLevel, how = S.failLevel, 'сообщение сервера'
-            else
-                local real = levelFromItem(pressRev)
-                if real and real <= before then newLevel, how = real, 'данные инвентаря' end
-            end
             if sup then
-                -- Сервер сбрасывает супер-заточку с верстака при неудаче: ставим заново (или камень, если уровень упал ниже)
-                if not newLevel then
-                    newLevel, how = math.max(0, before - SUPER_FAIL_DROP), 'предположение'
-                end
-                S.level = newLevel
-                if newLevel >= SUPER_MIN_LEVEL then
-                    chat(string.format('{FFAA00}Неудача: уровень +%d -> +%d (%s). Снова пробуем с супер-заточкой.', before, newLevel, how))
-                else
-                    chat(string.format('{FFAA00}Неудача: уровень упал до +%d (%s). Убираю супер-заточку, снова точим камнями.', newLevel, how))
-                end
+                -- супер-заточка не сработала: уровень упал, снова нужны камни
+                S.level = math.max(0, S.level - SUPER_FAIL_DROP)
+                chat(string.format('{FFAA00}Супер-заточка не сработала: считаю, что уровень упал до +%d.', S.level))
                 placed = false
-            elseif newLevel and newLevel ~= before then
-                S.level = newLevel
-                chat(string.format('{FFAA00}Уровень изменился: +%d -> +%d (%s).', before, newLevel, how))
-            end
-            if sup then
-                -- (всё уже сделано выше)
             elseif res.amount and res.amount < lastNeed then
                 chat('{FFAA00}Камни в ячейке закончились, ставлю новые...')
                 placed = false
             elseif REPLACE_EVERY > 0 and noWin % REPLACE_EVERY == 0 then
                 placed = false   -- страховка: заново кладём предмет и камень (без очистки ячеек)
             end
-        end
-
-        -- Уровень мог пересечь границу +SUPER_MIN_LEVEL (в любую сторону): тогда меняем состав ячеек
-        if placed and S.runSuper then
-            if phaseKind() ~= lastKind or needSuper() ~= (sup ~= nil) then placed = false end
         end
 
         pause(CYCLE_DELAY)
@@ -1085,19 +985,7 @@ function sampev.onServerMessage(color, text)
         return
     end
 
-    -- Строки о неудаче НЕ считаются результатом: неудачей считается отсутствие "Успех!" за FAIL_WAIT_MS.
-    -- Но если в такой строке есть уровни ("... с +13 на +12"), запоминаем новый уровень: он точнее предположения.
-    if S.awaiting and not S.result then
-        local nf = norm(clean)
-        local pf = nf:find(norm('неудач'), 1, true) or nf:find(norm('не удалось'), 1, true)
-        if pf and pf <= 30 then
-            dump('FAIL MSG: ' .. clean)
-            local nums = {}
-            for d in clean:gmatch('%+(%d+)') do nums[#nums + 1] = tonumber(d) end
-            local lv = nums[#nums]
-            if lv and #nums >= 2 and lv <= S.level and lv >= 0 then S.failLevel = lv end
-        end
-    end
+    -- Строки о неудаче НЕ читаем: неудачей считается отсутствие "Успех!" за FAIL_WAIT_MS.
 
     -- Дальше - только пока ждём результат.
     -- Эти строки НИЧЕГО не меняют сразу: только запоминаем сигнал. Цикл примет его, лишь если за
@@ -1206,15 +1094,11 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         dump(string.format('ПАРСИНГ ДИАЛОГА: предметов %d, новых слотов %d, style %s', n, newSlots, tostring(style)))
         for _, ex in ipairs(extras) do dump('  служебная строка #' .. ex.idx .. ': ' .. ex.text) end
 
-        if S.scanning and not S.scanDone then
+        if S.scanning then
             S.lastExtras = extras
-            -- защита от зацикливания: уже виденная страница (тот же текст) = дальше листать нечего
-            local sig = tostring(#(text or '')) .. ':' .. tostring(text or ''):sub(1, 200) .. ':' .. tostring(text or ''):sub(-200)
-            local repeated = S.seenPages and S.seenPages[sig]
-            if S.seenPages then S.seenPages[sig] = true end
             -- Диалог разбит на страницы? Нажимаем "Следующая страница", пока появляются новые слоты.
             local nxt = findNextPageItem(extras)
-            if nxt and newSlots > 0 and not repeated and (S.pages or 0) < 40 then
+            if nxt and newSlots > 0 and S.pages < 40 then
                 respondDialogLater(id, 1, nxt.idx)
             else
                 S.scanDone = true
@@ -1226,15 +1110,10 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
     end
 
     -- окно "Основная статистика": нажимаем левую кнопку "Предметы"
-    if S.scanning and not S.scanDone then
+    if S.scanning then
         local t = norm(title or '') .. ' ' .. norm(text or '')
         if t:find('статистика', 1, true) or t:find('авторизация', 1, true) then
             S.dialogSeen = true
-            S.statsClicks = (S.statsClicks or 0) + 1
-            if S.statsClicks > 4 then
-                S.scanDone = true   -- "Выход" возвращает в статистику снова и снова: хватит, закрываем
-                return
-            end
             respondDialogLater(id, 1, 0)
             return false
         end
@@ -1261,18 +1140,6 @@ imgui.OnInitialize(function()
     end
     imgui.GetStyle().WindowRounding = 8
     imgui.GetStyle().FrameRounding = 5
-end)
-
--- Окошко на время сканирования (раньше меню просто пропадало, и при зависании скана было непонятно что происходит)
-imgui.OnFrame(function() return S.scanning end, function(self)
-    local sx, sy = getScreenResolution()
-    imgui.SetNextWindowPos(imgui.ImVec2(sx / 2, sy / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
-    imgui.SetNextWindowSize(imgui.ImVec2(300, 90), imgui.Cond.Always)
-    if imgui.Begin(ui'Сканирование', nil, imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoMove) then
-        imgui.Text(ui(string.format('Сканирую инвентарь... страниц: %d', S.pages or 0)))
-        if imgui.Button(ui'Отмена', imgui.ImVec2(-1, 28)) then S.scanCancel = true end
-    end
-    imgui.End()
 end)
 
 -- Меню 1: выбор аксессуара
@@ -1820,9 +1687,8 @@ function main()
     chat('Загружен. Команда {FFD700}/toch{FFFFFF}, помощь: /toch_help. Аварийная остановка: {FFD700}F12')
     while true do
         wait(0)
-        if isKeyJustPressed(0x7B) then -- F12
-            if S.running then stopRun('Аварийная остановка (F12).') end
-            if S.scanning then S.scanCancel = true chat('Сканирование отменено (F12).') end
+        if S.running and isKeyJustPressed(0x7B) then -- F12
+            stopRun('Аварийная остановка (F12).')
         end
     end
 end
