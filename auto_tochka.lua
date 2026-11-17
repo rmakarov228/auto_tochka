@@ -1,6 +1,6 @@
 script_name('AutoToch')
 script_author('Claude')
-script_version('1.6')
+script_version('1.7')
 script_description('Авто-заточка аксессуаров Arizona RP до целевого уровня (/toch)')
 
 -- ВАЖНО: сохраняйте файл в кодировке UTF-8.
@@ -23,17 +23,20 @@ local function ui(s) return s end
 -- НАСТРОЙКИ
 ------------------------------------------------------------------------
 local TARGET_LEVEL   = 12      -- до какого уровня точим (можно менять: /toch_level 10)
-local START_DELAY    = 800     -- пауза перед первым кликом после старта, мс
-local CLICK_DELAY    = 500     -- пауза: положил аксессуар -> кладу камень, мс
-local BUTTON_DELAY   = 500     -- пауза: положил камень -> жму "Заточить предмет", мс
-local CYCLE_DELAY    = 1200    -- пауза после результата до следующей попытки, мс
-local DELAY_JITTER   = 150     -- случайная добавка к каждой паузе (0..N мс)
+local START_DELAY    = 300     -- пауза перед первым кликом после старта, мс
+local CLICK_DELAY    = 150     -- пауза после того, как предмет и камень положены, мс
+local BUTTON_DELAY   = 150     -- пауза: положил камень -> жму "Заточить предмет", мс
+local CYCLE_DELAY    = 450     -- ЗАДЕРЖКА МЕЖДУ НАЖАТИЯМИ "Заточить предмет": пауза после результата до следующего нажатия, мс
+local MIN_PRESS_GAP  = 700     -- минимум между двумя отправками "Заточить предмет" вообще (защита от двойных кликов), мс
+local DELAY_JITTER   = 100     -- случайная добавка к каждой паузе (0..N мс)
+local SIGNAL_CONFIRM_MS = 2500 -- служебная строка чата ("не хватает", "макс. уровень") принимается, только если за это время
+                               -- не пришёл настоящий результат заточки (защита от случайных строк в чате), мс
 local RESULT_TIMEOUT = 10000   -- сколько ждать ответ после попытки, мс. Если за это время ничего не произошло -
                                -- считаем, что слоты пустые / не хватило ресурса, и переставляем предмет и камни
-local CLICK_RETRY_MS  = 3000   -- если за это время нет ответа, ПОВТОРНО жмём "Заточить" (клик мог проигнорироваться
+local CLICK_RETRY_MS  = 4000   -- если за это время нет ответа, ПОВТОРНО жмём "Заточить" (клик мог проигнорироваться
                                -- из-за анимации), и только потом переставляем предмет и камни
 local CLICK_RETRIES   = 2      -- сколько раз повторять клик до переустановки
-local MAX_TIMEOUTS   = 3       -- сколько раз подряд "ничего не произошло" допускаем до остановки
+local MAX_TIMEOUTS   = 6       -- сколько раз подряд "ничего не произошло" допускаем до остановки
 local SCAN_WINDOW    = 2500    -- сколько слушать инвентарь после /stats, мс
 local FLASH_DURATION = 1.6     -- длительность зелёной вспышки, сек
 local STATS_COMMAND  = '/stats'
@@ -656,11 +659,16 @@ local function sharpenItem(slot, isFirst)
 
     chat(string.format('Предмет %d/%d: %s, цель +%d', S.qIndex, S.qTotal, it.name or ('слот ' .. slot), currentTarget()))
 
-    -- Ставит предмет и ресурс в ячейки верстака. Возвращает стопку ресурса или nil (тогда уже вызван stopRun).
-    local function place()
-        sendEnchantSlots(-1, -1, -1)          -- чистим ячейки только при (пере)установке
-        pause(150)
-        if not S.running then return nil end
+    -- Ставит предмет и ресурс в ячейки верстака ОДНИМ пакетом (поверх прежнего содержимого).
+    -- Ячейки больше не очищаются и камень не "вынимается" на время: так ничего не вылетает на верстак.
+    -- hardReset - очистка только как крайняя мера (второй "нет ответа" подряд).
+    -- Возвращает стопку ресурса или nil (тогда уже вызван stopRun).
+    local function place(hardReset)
+        if hardReset then
+            sendEnchantSlots(-1, -1, -1)
+            pause(60)
+            if not S.running then return nil end
+        end
 
         local kind = phaseKind()
         if kind ~= lastKind then lastNeed, lastKind = 1, kind end   -- камни и амулеты расходуются по-разному
@@ -681,13 +689,20 @@ local function sharpenItem(slot, isFirst)
             end
         end
 
-        -- 1) кладём аксессуар в ячейку "Предмет"
-        S.need = nil
-        sendEnchantSlots(slot, -1, -1)
+        local function put(c)
+            local left, right = -1, -1
+            if RESOURCE_FIELD[kind] == 'left' then left = c.slot else right = c.slot end
+            if sup then left = sup.slot end     -- ячейка "Супер-заточка"
+            sendEnchantSlots(slot, left, right)
+        end
 
-        -- клиент сообщает, сколько камней нужно для этого уровня: "(4 шт.)"
+        -- предмет + камень/амулет сразу
+        S.need = nil
+        put(cand)
+
+        -- клиент сообщает, сколько камней нужно для этого уровня: "(4 шт.)" - ждём недолго и выходим сразу, как пришло
         local t1 = os.clock() * 1000
-        while S.running and not S.need and (os.clock() * 1000 - t1) < 1200 do wait(50) end
+        while S.running and not S.need and (os.clock() * 1000 - t1) < 350 do wait(25) end
         local need = S.need or lastNeed
         lastNeed = need
         if cand.amount and cand.amount < need then
@@ -696,16 +711,9 @@ local function sharpenItem(slot, isFirst)
                 stopRun(string.format('{FF5555}Для заточки нужно %d шт., в инвентаре столько нет. Остановка.', need))
                 return nil
             end
+            put(cand)   -- перекладываем другую стопку поверх, без очистки
         end
-        pause(CLICK_DELAY)
-        if not S.running then return nil end
-
-        -- 2) кладём камень / амулет
-        local left, right = -1, -1
-        if RESOURCE_FIELD[kind] == 'left' then left = cand.slot else right = cand.slot end
-        if sup then left = sup.slot end     -- ячейка "Супер-заточка"
-        sendEnchantSlots(slot, left, right)
-        pause(BUTTON_DELAY)
+        pause(CLICK_DELAY + BUTTON_DELAY)
         if not S.running then return nil end
 
         placed = true
@@ -725,16 +733,20 @@ local function sharpenItem(slot, isFirst)
         -- Ставим предмет и камни ТОЛЬКО если они не лежат на верстаке:
         -- в начале, после повышения уровня, когда стопка кончилась или когда "ничего не нажимается".
         if not placed then
-            res = place()
+            res = place(stuck >= 2)
             if not res or not S.running then return 'stop' end
         end
 
         -- кнопка "Заточить предмет" (в обычном режиме - единственное действие за попытку)
-        S.result, S.restock = nil, false
+        S.result, S.restock, S.signal = nil, false, nil
+        -- задержка между нажатиями "Заточить предмет": не чаще, чем раз в MIN_PRESS_GAP
+        while S.running and S.lastPressMs and (os.clock() * 1000 - S.lastPressMs) < MIN_PRESS_GAP do wait(25) end
+        if not S.running then return 'stop' end
         S.awaiting = true
         S.attempts = S.attempts + 1
         sendCef('startEnchant')
         S.lastSend = os.clock()
+        S.lastPressMs = os.clock() * 1000
 
         local t0 = os.clock() * 1000
         local tSent, retries = t0, 0
@@ -749,6 +761,20 @@ local function sharpenItem(slot, isFirst)
                 tSent = now
                 sendCef('startEnchant')
                 S.lastSend = os.clock()
+                S.lastPressMs = os.clock() * 1000
+            end
+            -- служебная строка чата подтверждается только если настоящего результата так и не было
+            local sg = S.signal
+            if sg and not S.result and (now - sg.t) >= SIGNAL_CONFIRM_MS then
+                S.signal = nil
+                if sg.kind == 'max' then
+                    S.itemMax = true
+                elseif sg.kind == 'stop' then
+                    stopRun('{FF5555}Сервер: ' .. sg.text)
+                else
+                    S.restockText = sg.text
+                    S.restock = true
+                end
             end
         end
         S.awaiting = false
@@ -944,6 +970,7 @@ function sampev.onServerMessage(color, text)
         from, to = tonumber(from), tonumber(to)
         if to and from and to == from + 1 and from >= 0 and to <= 30 then
             dump(string.format('ACCEPT success color=%s: %s', tostring(color), clean))
+            S.signal = nil
             S.level = to
             S.okCount = S.okCount + 1
             S.result = { ok = true, from = from, to = to }
@@ -962,6 +989,7 @@ function sampev.onServerMessage(color, text)
         ffrom, fto = tonumber(ffrom), tonumber(fto)
         if ffrom and ffrom >= 0 and ffrom <= 30 then
             dump(string.format('ACCEPT fail color=%s: %s', tostring(color), clean))
+            S.signal = nil
             S.level = ffrom
             S.failCount = S.failCount + 1
             S.result = { ok = false, from = ffrom, newLevel = (fto and fto < ffrom) and fto or nil }
@@ -970,14 +998,16 @@ function sampev.onServerMessage(color, text)
         return
     end
     -- Запасной разбор: у супер-заточки текст неудачи может отличаться ("Увы ... понижен до +11" и т.п.)
-    -- Строго: сообщение начинается с "Увы" и содержит уровень "+N"
-    if S.awaiting and startsNear(clean, 'Увы', 12) and clean:find('%+%d+') then
+    -- Строго: начинается с "Увы", есть уровень "+N" и речь про улучшение/заточку предмета
+    if S.awaiting and startsNear(clean, 'Увы', 6) and clean:find('%+%d+')
+       and hasAny(clean, { 'улучш', 'заточ' }) then
         local nums = {}
         for v in clean:gmatch('%+(%d+)') do nums[#nums + 1] = tonumber(v) end
         local from = nums[1] or S.level
         local newLv
         if #nums >= 2 and nums[#nums] < nums[1] then newLv = nums[#nums] end
         dump(string.format('ACCEPT fail(generic) color=%s: %s', tostring(color), clean))
+        S.signal = nil
         S.level = from
         S.failCount = S.failCount + 1
         S.result = { ok = false, from = from, newLevel = newLv }
@@ -985,30 +1015,34 @@ function sampev.onServerMessage(color, text)
         return
     end
 
-    -- Дальше - только пока ждём результат
+    -- Дальше - только пока ждём результат.
+    -- Эти строки НИЧЕГО не меняют сразу: только запоминаем сигнал. Цикл примет его, лишь если за
+    -- SIGNAL_CONFIRM_MS не придёт настоящий результат (так случайная строка в чате не выбросит предмет и камни).
     if not S.awaiting then return end
     S.lastMsg = clean   -- для диагностики: что сервер писал, пока мы ждали ответ
+    if S.signal then return end   -- уже есть необработанный сигнал
     local n = norm(clean)
     for _, kw in ipairs(ITEM_MAX_KEYWORDS) do
-        if n:find(norm(kw), 1, true) then
-            S.itemMax = true
+        if n:find(norm(kw), 1, true) and (n:find('предмет', 1, true) or n:find('заточ', 1, true) or n:find('улучш', 1, true)) then
+            S.signal = { kind = 'max', text = clean, t = os.clock() * 1000 }
             return
         end
     end
     for _, kw in ipairs(HARD_STOP_KEYWORDS) do
-        if n:find(norm(kw), 1, true) then
-            stopRun('{FF5555}Сервер: ' .. clean)
+        local pos = n:find(norm(kw), 1, true)
+        if pos and pos <= 30 then   -- фраза в самом начале сообщения, а не где-то в середине
+            S.signal = { kind = 'stop', text = clean, t = os.clock() * 1000 }
             return
         end
     end
     -- не хватает ресурса: цикл сам переставит предмет и камни.
-    -- Только если сообщение про заточку/ресурсы (иначе любая служебная строка сервера давала бы ложную тревогу).
+    -- Только если сообщение начинается с этой фразы и речь про заточку/ресурсы.
     for _, kw in ipairs(RESTOCK_KEYWORDS) do
-        if n:find(norm(kw), 1, true) then
+        local pos = n:find(norm(kw), 1, true)
+        if pos and pos <= 30 then
             for _, ctx in ipairs(RESTOCK_CONTEXT) do
                 if n:find(norm(ctx), 1, true) then
-                    S.restockText = clean
-                    S.restock = true
+                    S.signal = { kind = 'restock', text = clean, t = os.clock() * 1000 }
                     return
                 end
             end
@@ -1572,12 +1606,13 @@ local function runSub(cmd, rest)
         -- /toch_delay 1500 : одна общая пауза между действиями (мс)
         local n = tonumber(rest)
         if n and n >= 100 and n <= 10000 then
-            CLICK_DELAY, BUTTON_DELAY, START_DELAY = n, n, math.floor(n * 1.5)
-            CYCLE_DELAY = n * 2
-            chat(string.format('Паузы: между кликами %d мс, перед кнопкой %d мс, между попытками %d мс', n, n, n * 2))
+            BUTTON_DELAY, START_DELAY = n, math.floor(n * 1.5)
+            CYCLE_DELAY = n
+            MIN_PRESS_GAP = math.max(MIN_PRESS_GAP, n)
+            chat(string.format('Паузы: перед кнопкой %d мс, между нажатиями "Заточить предмет" %d мс', n, n))
         else
-            chat(string.format('Использование: /toch_delay <100-10000 мс>. Сейчас: клики %d, кнопка %d, цикл %d',
-                CLICK_DELAY, BUTTON_DELAY, CYCLE_DELAY))
+            chat(string.format('Использование: /toch_delay <100-10000 мс>. Сейчас: перед кнопкой %d, между нажатиями %d, минимум между кликами %d',
+                BUTTON_DELAY, CYCLE_DELAY, MIN_PRESS_GAP))
         end
     elseif cmd == 'learn' then
         chat('Обучение больше не нужно: события верстака уже вшиты в скрипт.')
