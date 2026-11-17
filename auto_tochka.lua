@@ -1,6 +1,6 @@
 script_name('AutoToch')
 script_author('Claude')
-script_version('1.2')
+script_version('1.3')
 script_description('Авто-заточка аксессуаров Arizona RP до целевого уровня (/toch)')
 
 -- ВАЖНО: сохраняйте файл в кодировке UTF-8.
