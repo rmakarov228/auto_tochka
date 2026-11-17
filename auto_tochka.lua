@@ -1,6 +1,6 @@
 script_name('AutoToch')
 script_author('Claude')
-script_version('1.9')
+script_version('2.0')
 script_description('Авто-заточка аксессуаров Arizona RP до целевого уровня (/toch)')
 
 -- ВАЖНО: сохраняйте файл в кодировке UTF-8.
@@ -24,8 +24,8 @@ local function ui(s) return s end
 ------------------------------------------------------------------------
 local TARGET_LEVEL   = 12      -- до какого уровня точим (можно менять: /toch_level 10)
 local START_DELAY    = 300     -- пауза перед первым кликом после старта, мс
-local CLICK_DELAY    = 150     -- пауза после того, как предмет и камень положены, мс
-local BUTTON_DELAY   = 150     -- пауза: положил камень -> жму "Заточить предмет", мс
+local CLICK_DELAY    = 200     -- пауза после того, как предмет и камень положены, мс
+local BUTTON_DELAY   = 200     -- пауза: положил камень -> жму "Заточить предмет", мс
 local CYCLE_DELAY    = 0       -- ЗАДЕРЖКА МЕЖДУ НАЖАТИЯМИ "Заточить предмет": пауза после результата до следующего нажатия, мс
 local MIN_PRESS_GAP  = 6000    -- ИНТЕРВАЛ: кнопка "Заточить предмет" жмётся каждые 6 сек (заточка 4 сек + кд 2 сек), мс
 local DELAY_JITTER   = 100     -- случайная добавка к каждой паузе (0..N мс)
@@ -33,7 +33,7 @@ local SIGNAL_CONFIRM_MS = 2500 -- служебная строка чата ("н�
                                -- не пришёл настоящий результат заточки (защита от случайных строк в чате), мс
 local FAIL_WAIT_MS   = 6000   -- сколько ждём "Успех!" после нажатия (равно интервалу между нажатиями), мс
                                -- Неудачи не читаются и не пишутся в чат: нет "Успех!" - просто ждём следующий цикл
-local REPLACE_EVERY   = 5      -- после стольких неудач подряд заново кладём предмет и камень (самовосстановление), 0 = никогда
+local REPLACE_EVERY   = 10     -- после стольких неудач подряд заново кладём предмет и камень (самовосстановление), 0 = никогда
 local MAX_TIMEOUTS   = 6       -- сколько раз подряд "ничего не произошло" допускаем до остановки
 local SCAN_WINDOW    = 2500    -- сколько слушать инвентарь после /stats, мс
 local FLASH_DURATION = 1.6     -- длительность зелёной вспышки, сек
@@ -653,22 +653,18 @@ local function sharpenItem(slot, isFirst)
     local res                -- текущая стопка ресурса в ячейке
     local sup                -- текущая стопка супер-заточки (если используется)
     local stuck    = 0
+    local needReset = true   -- перед самой первой установкой этого предмета очищаем ячейки один раз
     local noWin    = 0       -- сколько неудач подряд (без "Успех!")
     local restockFails = 0
 
     chat(string.format('Предмет %d/%d: %s, цель +%d', S.qIndex, S.qTotal, it.name or ('слот ' .. slot), currentTarget()))
 
-    -- Ставит предмет и ресурс в ячейки верстака ОДНИМ пакетом (поверх прежнего содержимого).
-    -- Ячейки больше не очищаются и камень не "вынимается" на время: так ничего не вылетает на верстак.
-    -- hardReset - очистка только как крайняя мера (второй "нет ответа" подряд).
-    -- Возвращает стопку ресурса или nil (тогда уже вызван stopRun).
+    -- Ставит предмет и ресурс в ячейки верстака в проверенном порядке: предмет -> (ждём подсказку "N шт.") -> камень.
+    -- Очистка ячеек (-1,-1,-1) делается ТОЛЬКО при первой установке предмета (hardReset), дальше предмет и камень
+    -- просто перезаписываются поверх, чтобы ничего не вылетало на верстак.
+    -- Всё это происходит в паузе между нажатиями (кулдаун 2 сек), на скорость цикла не влияет.
+    -- Возвращает стопку ресурса или nil (тогда уже вызван stopRun, предмет остаётся на верстаке).
     local function place(hardReset)
-        if hardReset then
-            sendEnchantSlots(-1, -1, -1)
-            pause(60)
-            if not S.running then return nil end
-        end
-
         local kind = phaseKind()
         if kind ~= lastKind then lastNeed, lastKind = 1, kind end   -- камни и амулеты расходуются по-разному
         local cand = findResource(kind, lastNeed)
@@ -688,20 +684,19 @@ local function sharpenItem(slot, isFirst)
             end
         end
 
-        local function put(c)
-            local left, right = -1, -1
-            if RESOURCE_FIELD[kind] == 'left' then left = c.slot else right = c.slot end
-            if sup then left = sup.slot end     -- ячейка "Супер-заточка"
-            sendEnchantSlots(slot, left, right)
+        if hardReset then
+            sendEnchantSlots(-1, -1, -1)
+            pause(150)
+            if not S.running then return nil end
         end
 
-        -- предмет + камень/амулет сразу
+        -- 1) кладём аксессуар в ячейку "Предмет"
         S.need = nil
-        put(cand)
+        sendEnchantSlots(slot, -1, -1)
 
-        -- клиент сообщает, сколько камней нужно для этого уровня: "(4 шт.)" - ждём недолго и выходим сразу, как пришло
+        -- клиент сообщает, сколько камней нужно для этого уровня: "(4 шт.)" - выходим сразу, как пришло
         local t1 = os.clock() * 1000
-        while S.running and not S.need and (os.clock() * 1000 - t1) < 350 do wait(25) end
+        while S.running and not S.need and (os.clock() * 1000 - t1) < 1200 do wait(25) end
         local need = S.need or lastNeed
         lastNeed = need
         if cand.amount and cand.amount < need then
@@ -710,9 +705,16 @@ local function sharpenItem(slot, isFirst)
                 stopRun(string.format('{FF5555}Для заточки нужно %d шт., в инвентаре столько нет. Остановка.', need))
                 return nil
             end
-            put(cand)   -- перекладываем другую стопку поверх, без очистки
         end
-        pause(CLICK_DELAY + BUTTON_DELAY)
+        pause(CLICK_DELAY)
+        if not S.running then return nil end
+
+        -- 2) кладём камень / амулет (и супер-заточку, если нужна)
+        local left, right = -1, -1
+        if RESOURCE_FIELD[kind] == 'left' then left = cand.slot else right = cand.slot end
+        if sup then left = sup.slot end     -- ячейка "Супер-заточка"
+        sendEnchantSlots(slot, left, right)
+        pause(BUTTON_DELAY)
         if not S.running then return nil end
 
         placed = true
@@ -732,7 +734,8 @@ local function sharpenItem(slot, isFirst)
         -- Ставим предмет и камни ТОЛЬКО если они не лежат на верстаке:
         -- в начале, после повышения уровня, когда стопка кончилась или когда "ничего не нажимается".
         if not placed then
-            res = place(false)
+            res = place(needReset)
+            needReset = false
             if not res or not S.running then return 'stop' end
         end
 
@@ -907,13 +910,14 @@ local function sharpenLoop()
     end
 
     local finishedAll = S.running   -- running всё ещё true => очередь прошла до конца
+    local finalTarget = S.runTarget or TARGET_LEVEL
     S.awaiting = false
     S.running  = false
     S.curSlot  = nil
     S.runSuper, S.runTarget = false, nil
     if finishedAll then
         chatRaw(string.format('{00FF55}[AUTO TOCH] Очередь завершена: заточено %d, пропущено %d (цель +%d)',
-            doneN, skipN, S.runTarget))
+            doneN, skipN, finalTarget))
         lua_thread.create(function()
             wait(300)
             closeGameUi(true) -- один ESC, и только если интерфейс (верстак) открыт
@@ -1355,6 +1359,7 @@ local function downloadFile(url, path)
     return done
 end
 
+local showUpdateCef            -- объявлена заранее: используется в checkUpdate, определена ниже
 local updating      = false
 local winUpd        = new.bool(false)   -- окно "Доступно обновление"
 local pendingUpdate = nil               -- { version, url, changelog }
@@ -1453,7 +1458,7 @@ local function hideUpdateCef()
     evalCef("var e=document.getElementById('" .. UPD_PANEL_ID .. "');if(e){e.remove();}")
 end
 
-local function showUpdateCef(info, demo)
+showUpdateCef = function(info, demo)
     if cefPanelActive then return end
     cefPanelActive = true
     local js = table.concat({
